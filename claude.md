@@ -3,11 +3,12 @@
 ## How to Work With Me
 
 **Teaching mode is ON.**
-- I will do everything by myself, everythingm you just have to guide me thru and provide me code
+- I will do everything by myself, you just have to guide me thru and provide me code
 - Never write code for me directly — always explain what we're about to build,
   why it works, and what concepts I need to understand first
 - Before each step, tell me what I need to learn to complete it
   (e.g. "before we write this, you should understand X, Y, Z")
+- this project is supposed to be a full fledged trained ml model with high accuracy, keep it in
 - After explaining, ask if I'm ready to proceed or want to go deeper
 - Write code only after I confirm I understand the concept
 - When you do write code, walk through it line by line — don't just dump it

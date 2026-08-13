@@ -38,6 +38,13 @@ UNSW_DIR = DATA_RAW_DIR / "unsw_nb15"
 CICIDS_OUTPUT_PATH = DATA_PROCESSED_DIR / "cicids_clean.parquet"
 UNSW_OUTPUT_PATH = DATA_PROCESSED_DIR / "unsw_clean.parquet"
 
+# Common-schema versions of both datasets, used for genuine cross-dataset
+# validation in Phase 5 (see build_*_common_features() below) - the main
+# cleaned parquets above use each dataset's own native columns, which don't
+# overlap enough for a model trained on one to run on the other at all.
+CICIDS_COMMON_OUTPUT_PATH = DATA_PROCESSED_DIR / "cicids_common.parquet"
+UNSW_COMMON_OUTPUT_PATH = DATA_PROCESSED_DIR / "unsw_common.parquet"
+
 # Fitted LabelEncoders for UNSW-NB15's text columns, saved here so the exact
 # same string -> int mapping can be reapplied to live traffic in detector.py.
 UNSW_ENCODERS_PATH = MODELS_DIR / "unsw_label_encoders.joblib"
@@ -55,6 +62,14 @@ RANDOM_STATE = 42
 # Added to denominators in derived-feature ratios to avoid a divide-by-zero
 # producing inf (e.g. a flow with 0 backward packets).
 EPSILON = 1e-9
+
+# Floor applied to flow duration (in seconds) before computing bytes_per_sec.
+# UNSW-NB15 has ~1.4% of rows with duration == 0 exactly; dividing real byte
+# counts by EPSILON there sends bytes_per_sec up to the trillions (a repeat
+# of the same blowup fwd_bwd_ratio/flag_anomaly had). A near-zero duration
+# is a resolution limit, not a real instant transfer, so flooring it at a
+# plausible minimum (1ms) keeps the rate meaningful instead of astronomical.
+MIN_DURATION_SEC = 1e-3
 
 # --------------------------------------------------------------------------
 # Label mappings: raw dataset labels -> 5 unified attack classes
@@ -169,7 +184,7 @@ def engineer_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     total_bytes = df["Total Length of Fwd Packets"] + df["Total Length of Bwd Packets"]
     flow_duration_sec = df["Flow Duration"] / 1_000_000  # CICFlowMeter reports microseconds
-    df["bytes_per_sec"] = total_bytes / (flow_duration_sec + EPSILON)
+    df["bytes_per_sec"] = total_bytes / flow_duration_sec.clip(lower=MIN_DURATION_SEC)
 
     df["fwd_bwd_ratio"] = df["Total Fwd Packets"] / (df["Total Backward Packets"] + 1)
 
@@ -178,6 +193,28 @@ def engineer_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return df
+
+
+def drop_duplicate_feature_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows that are exact duplicates of another row's features.
+
+    CICIDS2017 has a substantial number of these (~11% of rows) - common
+    in automated attack traffic like DoS Hulk, which floods mechanically
+    identical packets in a tight loop and produces many near-identical
+    flow records. This must run before the train/test split: a random
+    split has no way to know a "different" row is a byte-for-byte twin of
+    one already seen in training, which silently inflates evaluation
+    metrics without real generalization (confirmed empirically - 13.41% of
+    a test split were exact duplicates of a training row before this fix).
+
+    Deduplicating on features only, not features+Label together, is
+    deliberate: it guarantees no feature pattern can appear on both sides
+    of the split, even in the case where identical traffic somehow carries
+    two different labels. keep="first" is an arbitrary tie-break for that
+    conflicting-label case specifically.
+    """
+    feature_cols = [c for c in df.columns if c != "Label"]
+    return df.drop_duplicates(subset=feature_cols, keep="first")
 
 
 # --------------------------------------------------------------------------
@@ -206,6 +243,7 @@ def load_cicids2017() -> pd.DataFrame:
             cleaned_chunks.append(chunk)
 
     df = pd.concat(cleaned_chunks, ignore_index=True)
+    df = drop_duplicate_feature_rows(df)
     df = drop_constant_columns(df)
     # Derived features reference specific raw column names (e.g. "SYN Flag
     # Count") that must still exist under those names at this point - some
@@ -342,9 +380,68 @@ def load_unsw_nb15() -> pd.DataFrame:
             cleaned_chunks.append(chunk)
 
     df = pd.concat(cleaned_chunks, ignore_index=True)
+    df = drop_duplicate_feature_rows(df)
     df = encode_categorical_columns(df, UNSW_CATEGORICAL_COLUMNS, UNSW_ENCODERS_PATH)
     df = drop_constant_columns(df)
     return df
+
+
+# --------------------------------------------------------------------------
+# Common feature set for cross-dataset validation (Phase 5)
+# --------------------------------------------------------------------------
+# CICIDS2017 (CICFlowMeter) and UNSW-NB15 (Argus) compute entirely
+# different feature sets under different names, so a model trained on
+# CICIDS2017's 25 selected features cannot run on UNSW-NB15 at all - most
+# of those columns don't exist there. These five, however, measure the
+# same underlying quantity in both datasets and can be mapped onto one
+# shared schema, which is what makes a genuine (if smaller) cross-dataset
+# comparison possible. fwd_bwd_ratio and bytes_per_sec are recomputed the
+# same way for both, since they're derived from these five, not native to
+# either capture tool.
+def build_cicids_common_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Map CICIDS2017 columns onto the shared cross-dataset feature schema.
+
+    "Flow Duration" is converted from microseconds to seconds so it's on
+    the same scale as UNSW-NB15's "dur" - confirmed to already be in
+    seconds (its max value tops out just under 60).
+    """
+    common = pd.DataFrame(
+        {
+            "duration": df["Flow Duration"] / 1_000_000,
+            "fwd_packets": df["Total Fwd Packets"],
+            "bwd_packets": df["Total Backward Packets"],
+            "fwd_bytes": df["Total Length of Fwd Packets"],
+            "bwd_bytes": df["Total Length of Bwd Packets"],
+        }
+    )
+    common["fwd_bwd_ratio"] = common["fwd_packets"] / (common["bwd_packets"] + 1)
+    common["bytes_per_sec"] = (common["fwd_bytes"] + common["bwd_bytes"]) / common[
+        "duration"
+    ].clip(lower=MIN_DURATION_SEC)
+    common["Label"] = df["Label"]
+    return common
+
+
+def build_unsw_common_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Map UNSW-NB15 columns onto the shared cross-dataset feature schema.
+
+    No unit conversion needed here - "dur" is already in seconds.
+    """
+    common = pd.DataFrame(
+        {
+            "duration": df["dur"],
+            "fwd_packets": df["spkts"],
+            "bwd_packets": df["dpkts"],
+            "fwd_bytes": df["sbytes"],
+            "bwd_bytes": df["dbytes"],
+        }
+    )
+    common["fwd_bwd_ratio"] = common["fwd_packets"] / (common["bwd_packets"] + 1)
+    common["bytes_per_sec"] = (common["fwd_bytes"] + common["bwd_bytes"]) / common[
+        "duration"
+    ].clip(lower=MIN_DURATION_SEC)
+    common["Label"] = df["Label"]
+    return common
 
 
 # --------------------------------------------------------------------------
@@ -372,6 +469,15 @@ def main() -> None:
     print(f"  {unsw_df.shape[0]:,} rows, {unsw_df.shape[1]} columns")
     unsw_df.to_parquet(UNSW_OUTPUT_PATH, index=False)
     print(f"  saved to {UNSW_OUTPUT_PATH}")
+
+    print("Building common cross-dataset feature set...")
+    cicids_common_df = build_cicids_common_features(cicids_df)
+    cicids_common_df.to_parquet(CICIDS_COMMON_OUTPUT_PATH, index=False)
+    print(f"  CICIDS2017 common features saved to {CICIDS_COMMON_OUTPUT_PATH}")
+
+    unsw_common_df = build_unsw_common_features(unsw_df)
+    unsw_common_df.to_parquet(UNSW_COMMON_OUTPUT_PATH, index=False)
+    print(f"  UNSW-NB15 common features saved to {UNSW_COMMON_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

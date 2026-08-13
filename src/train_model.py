@@ -23,8 +23,10 @@ import joblib
 import pandas as pd
 from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
+from xgboost import XGBClassifier
 
 # --------------------------------------------------------------------------
 # Paths
@@ -36,6 +38,8 @@ MODELS_DIR = PROJECT_ROOT / "models"
 CICIDS_PATH = DATA_PROCESSED_DIR / "cicids_clean.parquet"
 SELECTED_FEATURES_PATH = MODELS_DIR / "selected_features.json"
 SCALER_PATH = MODELS_DIR / "scaler.joblib"
+RF_MODEL_PATH = MODELS_DIR / "rf_model.joblib"
+XGB_MODEL_PATH = MODELS_DIR / "xgb_model.joblib"
 
 # --------------------------------------------------------------------------
 # Constants
@@ -47,6 +51,12 @@ TEST_SIZE = 0.2
 # rather than all the way to the majority class - see apply_smote().
 SMOTE_TARGET_CLASS = "Probe"
 TARGET_COLUMN = "Label"
+
+RF_N_ESTIMATORS = 200
+
+XGB_N_ESTIMATORS = 300
+XGB_MAX_DEPTH = 6
+XGB_LEARNING_RATE = 0.1
 
 # What fraction of X_train to use when fitting the quick Random Forest for
 # feature importances - a speed optimization, not a modeling choice.
@@ -177,6 +187,62 @@ def apply_smote(X_train: pd.DataFrame, y_train: pd.Series) -> tuple[pd.DataFrame
     return smote.fit_resample(X_train, y_train)
 
 
+def train_random_forest(X_train: pd.DataFrame, y_train: pd.Series) -> RandomForestClassifier:
+    """Train the Random Forest ensemble member on the scaled, SMOTE'd training set.
+
+    No class_weight='balanced' here, deliberately: apply_smote() already
+    rebalanced the classes. Adding loss-level class weighting on top of
+    that would double-correct for imbalance and likely overcorrect against
+    Normal/DoS precision.
+    """
+    rf = RandomForestClassifier(
+        n_estimators=RF_N_ESTIMATORS, n_jobs=-1, random_state=RANDOM_STATE
+    )
+    rf.fit(X_train, y_train)
+    return rf
+
+
+def train_xgboost(X_train: pd.DataFrame, y_train: pd.Series) -> XGBClassifier:
+    """Train the XGBoost ensemble member on the scaled, SMOTE'd training set.
+
+    tree_method="hist" is the fast, histogram-based split-finding
+    algorithm - the standard choice for tabular data at this scale.
+    Trained on the exact same data as train_random_forest() so the two
+    models' results are directly comparable, in particular on U2R, where
+    the Random Forest baseline is currently weak (0.22 precision).
+    """
+    xgb = XGBClassifier(
+        n_estimators=XGB_N_ESTIMATORS,
+        max_depth=XGB_MAX_DEPTH,
+        learning_rate=XGB_LEARNING_RATE,
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+    )
+    xgb.fit(X_train, y_train)
+    return xgb
+
+
+def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, model_name: str) -> float:
+    """Print a classification report and confusion matrix, return weighted F1.
+
+    Weighted F1 (not accuracy) is CLAUDE.md's target metric (>95%) -
+    accuracy alone would be misleading given how rare U2R/R2L are; a model
+    that never predicts them could still score high on accuracy.
+    """
+    y_pred = model.predict(X_test)
+
+    print(f"\n=== {model_name} evaluation ===")
+    print(classification_report(y_test, y_pred, digits=4))
+    print("Confusion matrix (rows=actual, cols=predicted):")
+    labels = sorted(y_test.unique())
+    print(pd.DataFrame(confusion_matrix(y_test, y_pred, labels=labels), index=labels, columns=labels))
+
+    weighted_f1 = f1_score(y_test, y_pred, average="weighted")
+    print(f"\nWeighted F1: {weighted_f1:.4f}")
+    return weighted_f1
+
+
 if __name__ == "__main__":
     X, y = load_features_and_target(CICIDS_PATH)
     X_train, X_test, y_train, y_test = split_train_test(X, y)
@@ -208,3 +274,11 @@ if __name__ == "__main__":
 
     print(f"\nFinal X_train: {X_train.shape}")
     print(f"Final X_test:  {X_test.shape}")
+
+    print("\nTraining Random Forest...")
+    rf_model = train_random_forest(X_train, y_train)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(rf_model, RF_MODEL_PATH)
+    print(f"Model saved to {RF_MODEL_PATH}")
+
+    evaluate_model(rf_model, X_test, y_test, "Random Forest")

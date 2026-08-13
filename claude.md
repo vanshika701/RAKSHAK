@@ -93,7 +93,7 @@ ids_project/
 
 ## Current Status
 - [x] Phase 1 — Environment setup
-- [ ] Phase 2 — Data pipeline
+- [x] Phase 2 — Data pipeline
 - [ ] Phase 3 — Feature engineering
 - [ ] Phase 4 — Model training
 - [ ] Phase 5 — Ensemble + cross-dataset validation

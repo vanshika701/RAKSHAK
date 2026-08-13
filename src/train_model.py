@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
@@ -279,6 +280,45 @@ def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMClassifier:
     return lgbm
 
 
+class SoftVotingEnsemble:
+    """Combines already-fitted models by averaging their predicted class
+    probabilities - soft voting, each model gets an equal vote.
+
+    Deliberately not sklearn's VotingClassifier: that class re-fits every
+    estimator internally on .fit(), which would mean retraining all three
+    models from scratch just to combine them, and doesn't work cleanly
+    with the custom LabelDecodingClassifier wrapper XGBoost needed. This
+    works directly with the three models exactly as they were trained.
+    """
+
+    def __init__(self, models: list, class_labels: np.ndarray):
+        self.models = models
+        self.classes_ = class_labels
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        probas = [model.predict_proba(X) for model in self.models]
+        return sum(probas) / len(probas)
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        predicted_indices = self.predict_proba(X).argmax(axis=1)
+        return self.classes_[predicted_indices]
+
+
+def build_soft_voting_ensemble(models: list) -> SoftVotingEnsemble:
+    """Build a soft-voting ensemble from a list of already-trained models.
+
+    Verifies all models agree on class order before combining - each
+    model's predict_proba() columns correspond to its own classes_, so if
+    they were ordered differently, averaging would silently mix up which
+    column means which class.
+    """
+    class_orders = [tuple(model.classes_) for model in models]
+    if len(set(class_orders)) != 1:
+        raise ValueError(f"Models disagree on class order: {class_orders}")
+
+    return SoftVotingEnsemble(models, np.array(class_orders[0]))
+
+
 def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, model_name: str) -> float:
     """Print a classification report and confusion matrix, return weighted F1.
 
@@ -352,3 +392,7 @@ if __name__ == "__main__":
     print(f"Model saved to {LGBM_MODEL_PATH}")
 
     evaluate_model(lgbm_model, X_test, y_test, "LightGBM")
+
+    print("\nBuilding soft-voting ensemble...")
+    ensemble = build_soft_voting_ensemble([rf_model, xgb_model, lgbm_model])
+    evaluate_model(ensemble, X_test, y_test, "Soft-Voting Ensemble")

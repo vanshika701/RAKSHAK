@@ -94,7 +94,7 @@ ids_project/
 ## Current Status
 - [x] Phase 1 — Environment setup
 - [x] Phase 2 — Data pipeline
-- [ ] Phase 3 — Feature engineering
+- [x] Phase 3 — Feature engineering
 - [ ] Phase 4 — Model training
 - [ ] Phase 5 — Ensemble + cross-dataset validation
 - [ ] Phase 6 — Live capture engine

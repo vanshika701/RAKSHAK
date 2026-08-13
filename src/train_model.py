@@ -19,9 +19,12 @@ Steps 3-7 are built incrementally; this file currently implements step 2.
 import json
 from pathlib import Path
 
+import joblib
 import pandas as pd
+from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
 
 # --------------------------------------------------------------------------
 # Paths
@@ -32,12 +35,17 @@ MODELS_DIR = PROJECT_ROOT / "models"
 
 CICIDS_PATH = DATA_PROCESSED_DIR / "cicids_clean.parquet"
 SELECTED_FEATURES_PATH = MODELS_DIR / "selected_features.json"
+SCALER_PATH = MODELS_DIR / "scaler.joblib"
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
+
+# SMOTE brings classes smaller than this reference class up to its size,
+# rather than all the way to the majority class - see apply_smote().
+SMOTE_TARGET_CLASS = "Probe"
 TARGET_COLUMN = "Label"
 
 # What fraction of X_train to use when fitting the quick Random Forest for
@@ -117,6 +125,58 @@ def save_selected_features(features: list[str], save_path: Path) -> None:
         json.dump(features, f, indent=2)
 
 
+def scale_features(
+    X_train: pd.DataFrame, X_test: pd.DataFrame, save_path: Path
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit MinMaxScaler on X_train only, transform both splits.
+
+    Same leakage principle as feature selection: the scaler's min/max must
+    never be influenced by values the model won't see until evaluation.
+    The fitted scaler is saved so detector.py can apply the identical
+    transform to live traffic later.
+    """
+    scaler = MinMaxScaler()
+    X_train_scaled = pd.DataFrame(
+        scaler.fit_transform(X_train), columns=X_train.columns, index=X_train.index
+    )
+    X_test_scaled = pd.DataFrame(
+        scaler.transform(X_test), columns=X_test.columns, index=X_test.index
+    )
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(scaler, save_path)
+    return X_train_scaled, X_test_scaled
+
+
+def apply_smote(X_train: pd.DataFrame, y_train: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
+    """Oversample severely underrepresented classes in the training set only.
+
+    Runs after scaling, not before: SMOTE generates synthetic minority-class
+    rows by interpolating between a real point and its nearest neighbors
+    (Euclidean distance), so unscaled byte-count columns would otherwise
+    dominate the distance calculation over ratio columns like fwd_bwd_ratio.
+
+    Rather than the default 'auto' strategy (which would oversample every
+    non-majority class up to match Normal - ~1.8M rows, ballooning U2R from
+    1,595 real rows to 1.8M mostly-synthetic ones), this brings only R2L
+    and U2R up to SMOTE_TARGET_CLASS's size. Full parity with the majority
+    would mean interpolating repeatedly from too few real anchor points to
+    produce genuine diversity, and would roughly quadruple the training set
+    size for no real benefit.
+
+    Applied only to X_train/y_train - never the test set, which must keep
+    real-world class frequencies so evaluation reflects genuine performance.
+    """
+    class_counts = y_train.value_counts()
+    target_count = class_counts[SMOTE_TARGET_CLASS]
+    sampling_strategy = {
+        label: target_count for label, count in class_counts.items() if count < target_count
+    }
+
+    smote = SMOTE(sampling_strategy=sampling_strategy, random_state=RANDOM_STATE)
+    return smote.fit_resample(X_train, y_train)
+
+
 if __name__ == "__main__":
     X, y = load_features_and_target(CICIDS_PATH)
     X_train, X_test, y_train, y_test = split_train_test(X, y)
@@ -137,5 +197,14 @@ if __name__ == "__main__":
     X_train = X_train[top_features]
     X_test = X_test[top_features]
 
-    print("\nTest class distribution:")
-    print(y_test.value_counts(normalize=True))
+    print("\nScaling features...")
+    X_train, X_test = scale_features(X_train, X_test, SCALER_PATH)
+    print(f"Scaler saved to {SCALER_PATH}")
+
+    print("\nApplying SMOTE to training set...")
+    print("Before:", y_train.value_counts().to_dict())
+    X_train, y_train = apply_smote(X_train, y_train)
+    print("After: ", y_train.value_counts().to_dict())
+
+    print(f"\nFinal X_train: {X_train.shape}")
+    print(f"Final X_test:  {X_test.shape}")

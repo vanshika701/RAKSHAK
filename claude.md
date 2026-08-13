@@ -111,6 +111,13 @@ conda activate ids_project
 # Run preprocessing
 python src/preprocess.py
 
+# Train all three models + ensemble
+# (run this, NOT `python src/train_model.py` directly - see run_training.py
+# for why: train_model.py defines custom classes that joblib needs to save
+# with a stable, importable module path, which only happens when the file
+# is imported rather than executed directly)
+python src/run_training.py
+
 # Run live detector (needs sudo for raw packet access)
 sudo python src/detector.py
 

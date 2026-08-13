@@ -6,6 +6,25 @@ zoomed-in version. Update this as items get done; it's a working note, not a del
 
 ---
 
+## Deferred — revisit later if time allows
+
+**U2R further improvement** (as of 2026-08-14): deliberately parking this here, not abandoning
+it. Current state is a defensible, evidence-based result (F1 0.35 → 0.65 via SHAP investigation
++ validated threshold tuning — see Phase 5), not a bug with an obvious fix left on the table.
+Decided to prioritize Phase 6-8 (live capture, dashboard, report) instead, since those are
+100% unstarted and load-bearing for the project being a finished, deliverable system, whereas
+further U2R work has real diminishing returns (root cause is only ~1,587 real training examples
+- not fixable without more real data). Nothing is locked in by deferring this: the classifier
+sits behind a stable `predict()`/`predict_proba()` interface, so swapping in an improved version
+later won't require touching `detector.py` or anything downstream. Ideas already on record if
+revisited: Borderline-SMOTE instead of plain SMOTE, feature selection targeted specifically at
+the U2R-vs-Normal boundary (see `PSH Flag Count` lead from the SHAP notebook).
+
+Suggested order from here: finish Colab tuning + cross-dataset validation (Phase 4/5 loose
+ends, already in flight) → Phase 6 → Phase 7 → Phase 8 → circle back to U2R only if time remains.
+
+---
+
 ## Phase 1 — Environment Setup
 - [ ] Set up Google Colab + Google Drive for the heavy hyperparameter-tuning runs (everything
       else in this phase is done and verified)
@@ -26,9 +45,23 @@ stratified split, the row-duplication leak fix).
 - [ ] Move XGBoost + LightGBM training to Colab with `RandomizedSearchCV` hyperparameter
       tuning — current versions are still the untuned diagnostic runs, not the final models
 - [ ] Decide whether Random Forest also gets a tuned pass, or stays as-is
-- [ ] Run SHAP analysis (`notebooks/02_shap_analysis.ipynb`) — feature importance + force
-      plots, specifically to investigate *why* U2R has such weak precision across all 3 models
+- [x] Run SHAP analysis (`notebooks/02_shap_analysis.ipynb`) — compared real U2R attacks vs.
+      Normal flows misclassified as U2R (targeted sample, not a random one — false positives are
+      only ~0.17% of the test set). Finding: nearly the same features (packet-size stats,
+      Destination Port) drive both groups, and both look like small/sparse low-volume flows —
+      evidence the model is using genuine, if ambiguous, signal rather than reacting to noise.
+      `PSH Flag Count` stood out as present in true positives but not false positives - a
+      possible lead for a more discriminating feature. Ties back to Phase 3: SMOTE likely
+      amplified this narrow "small flow" profile since the real 1,587 U2R examples were already
+      clustered around it.
 - [ ] Pull the tuned models back down from Colab into local `models/`
+- [x] Found and fixed a real bug along the way: `train_model.py`'s custom classes
+      (`LabelDecodingClassifier` etc.) broke when loaded from anywhere other than another direct
+      `python src/train_model.py` run, because Python tags classes defined in a directly-executed
+      script under the module `__main__`. Fixed by moving the pipeline into `main()` and adding
+      `src/run_training.py` as the real entry point (imports `train_model` instead of executing
+      it) - `python src/train_model.py` now refuses to run directly with an explanatory error.
+      CLAUDE.md's Key Commands updated accordingly.
 
 ## Phase 5 — Ensemble & Cross-Dataset Validation
 - [x] Build the soft-voting ensemble (XGBoost + LightGBM + Random Forest) — custom
@@ -39,6 +72,27 @@ stratified split, the row-duplication leak fix).
       over RF/XGBoost but didn't quite reach LightGBM alone (0.2941 vs 0.3067 precision) -
       equal-weight averaging dilutes LightGBM's edge on that one class. Possible future
       refinement: weighted voting instead of equal weights - not pursued yet.
+- [x] Reduced U2R's false-positive rate via a validation-tuned decision threshold, not
+      retraining. Built `split_train_val_test()` (train/val/test three-way split - X_train
+      identical to before), `SoftVotingEnsemble` weights support, and `ThresholdedEnsemble`
+      (requires extra confidence before predicting U2R, falls back to next-most-likely class
+      otherwise - doesn't touch how any other class is decided). Weighted voting was tried first
+      and rejected: best case only lifted U2R F1 by ~3% relative while measurably hurting R2L
+      (0.9817 → 0.9706 as weight shifted toward LightGBM) - not a good trade. Threshold tuning
+      won clearly instead: swept 0.2-0.99 on validation only (never test, to avoid a quieter
+      repeat of the duplicate-row leak fixed earlier); U2R F1 and macro F1 both peak at
+      **threshold = 0.80** (`U2R_DECISION_THRESHOLD` in train_model.py) and decline past it.
+      Confirmed once on the untouched test set: U2R F1 0.4457 → **0.6526**, false U2R alarms
+      458 → **122** (-73%), weighted F1 0.9977 → **0.9985**, macro F1 0.8795 → **0.9245** - the
+      overall system improved, not just U2R, confirming this isn't a zero-sum trade. Test-set
+      numbers closely matched what validation predicted (0.5596/0.7828 vs 0.5692/0.7437
+      precision/recall), confirming the threshold genuinely generalizes rather than overfitting
+      to validation noise. Real cost, worth stating plainly: recall dropped from 93% to 78%, so
+      some real U2R attacks now go undetected in exchange for far fewer false alarms - a
+      genuine security trade-off, not a pure win, and worth presenting in the report as a
+      tunable parameter with documented trade-offs rather than an unambiguous improvement.
+      Merged into `main()` as an additional final evaluation step, kept alongside the plain
+      ensemble rather than replacing it so the improvement stays visible.
 - [ ] Train/evaluate a model on the common 6-feature schema for genuine cross-dataset
       validation — infrastructure already built and verified (`cicids_common.parquet` /
       `unsw_common.parquet`), just needs a model trained on it

@@ -50,6 +50,12 @@ LGBM_MODEL_PATH = MODELS_DIR / "lgbm_model.joblib"
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
+# The held-out TEST_SIZE portion is further split evenly into validation
+# and test - see split_train_val_test(). Ensemble weights and the U2R
+# decision threshold get tuned on validation only, never test, so the
+# final test-set number stays an honest, unpeeked-at evaluation.
+VAL_FRACTION_OF_HOLDOUT = 0.5
+
 # SMOTE brings classes smaller than this reference class up to its size,
 # rather than all the way to the majority class - see apply_smote().
 SMOTE_TARGET_CLASS = "Probe"
@@ -65,6 +71,16 @@ LGBM_N_ESTIMATORS = 300
 LGBM_MAX_DEPTH = 6
 LGBM_LEARNING_RATE = 0.1
 
+# Chosen via sweep_u2r_threshold() on the validation set only (never test -
+# see split_train_val_test()'s docstring), then confirmed once on the
+# untouched test set: U2R F1 and macro F1 both peak at this value (U2R F1
+# 0.6449 on validation, 0.6526 on test - the closeness of those two numbers
+# is what confirms this threshold generalizes rather than overfitting to
+# validation noise). Trades recall for precision specifically on U2R only -
+# see the PROGRESS.md / chat discussion for the practical trade-off this
+# implies once this feeds into detector.py's live inference in Phase 6.
+U2R_DECISION_THRESHOLD = 0.80
+
 # What fraction of X_train to use when fitting the quick Random Forest for
 # feature importances - a speed optimization, not a modeling choice.
 FEATURE_SAMPLE_FRAC = 0.10
@@ -79,23 +95,40 @@ def load_features_and_target(parquet_path: Path) -> tuple[pd.DataFrame, pd.Serie
     return X, y
 
 
-def split_train_test(
-    X: pd.DataFrame, y: pd.Series
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    """Stratified 80/20 train/test split.
+def split_train_val_test(X: pd.DataFrame, y: pd.Series) -> tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series
+]:
+    """Stratified three-way split: ~70% train, ~10% validation, ~20% test.
 
-    stratify=y keeps class proportions identical in both splits - critical
-    here since U2R is only ~0.07% of the data; a plain random split could
-    easily over- or under-represent it in the test set purely by chance.
+    stratify=y keeps class proportions identical across all three splits -
+    critical here since U2R is only ~0.07% of the data; a plain random
+    split could easily over- or under-represent it purely by chance.
 
-    Everything downstream that fits to data (feature selection, the
-    scaler, SMOTE) must only ever be fit on the training split returned
-    here, never the test split - see the leakage discussion in
-    preprocess.py's main() docstring.
+    The first cut (train vs. the rest) uses the exact same TEST_SIZE and
+    random_state this project has always used, so X_train comes out
+    identical to what a plain train/test split would have produced -
+    already-trained models remain valid without retraining. The held-out
+    portion is then split evenly into validation and test.
+
+    Why a third split at all: everything that fits to data (feature
+    selection, the scaler, SMOTE) is fit on train only, as before - but
+    tuning a decision rule (ensemble weights, the U2R confidence
+    threshold) using test-set performance and then reporting that same
+    performance would be a quieter form of the leakage already fixed once
+    in preprocess.py. Validation is what tuning is allowed to look at;
+    test gets checked exactly once, at the end, with the chosen config.
     """
-    return train_test_split(
+    X_train, X_holdout, y_train, y_holdout = train_test_split(
         X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
     )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_holdout,
+        y_holdout,
+        test_size=VAL_FRACTION_OF_HOLDOUT,
+        stratify=y_holdout,
+        random_state=RANDOM_STATE,
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
 
 def select_top_features(
@@ -282,7 +315,8 @@ def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMClassifier:
 
 class SoftVotingEnsemble:
     """Combines already-fitted models by averaging their predicted class
-    probabilities - soft voting, each model gets an equal vote.
+    probabilities - soft voting. Each model gets an equal vote unless
+    `weights` says otherwise.
 
     Deliberately not sklearn's VotingClassifier: that class re-fits every
     estimator internally on .fit(), which would mean retraining all three
@@ -291,20 +325,27 @@ class SoftVotingEnsemble:
     works directly with the three models exactly as they were trained.
     """
 
-    def __init__(self, models: list, class_labels: np.ndarray):
+    def __init__(
+        self, models: list, class_labels: np.ndarray, weights: list[float] | None = None
+    ):
         self.models = models
         self.classes_ = class_labels
+        self.weights = weights if weights is not None else [1.0] * len(models)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        probas = [model.predict_proba(X) for model in self.models]
-        return sum(probas) / len(probas)
+        weighted_probas = [
+            weight * model.predict_proba(X) for model, weight in zip(self.models, self.weights)
+        ]
+        return sum(weighted_probas) / sum(self.weights)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         predicted_indices = self.predict_proba(X).argmax(axis=1)
         return self.classes_[predicted_indices]
 
 
-def build_soft_voting_ensemble(models: list) -> SoftVotingEnsemble:
+def build_soft_voting_ensemble(
+    models: list, weights: list[float] | None = None
+) -> SoftVotingEnsemble:
     """Build a soft-voting ensemble from a list of already-trained models.
 
     Verifies all models agree on class order before combining - each
@@ -316,7 +357,45 @@ def build_soft_voting_ensemble(models: list) -> SoftVotingEnsemble:
     if len(set(class_orders)) != 1:
         raise ValueError(f"Models disagree on class order: {class_orders}")
 
-    return SoftVotingEnsemble(models, np.array(class_orders[0]))
+    return SoftVotingEnsemble(models, np.array(class_orders[0]), weights)
+
+
+class ThresholdedEnsemble:
+    """Wraps a soft-voting ensemble to require extra confidence before
+    predicting one specific class, falling back to the next-most-likely
+    class otherwise.
+
+    This is a precision/recall trade-off applied only to `target_class`,
+    without changing how any other class is decided - raising the bar for
+    "is this U2R?" doesn't touch how DoS/Normal/Probe/R2L get predicted.
+    """
+
+    def __init__(self, ensemble: SoftVotingEnsemble, target_class: str, threshold: float):
+        self.ensemble = ensemble
+        self.target_class = target_class
+        self.threshold = threshold
+        self.classes_ = ensemble.classes_
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        return self.ensemble.predict_proba(X)
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        proba = self.predict_proba(X)
+        target_index = list(self.classes_).index(self.target_class)
+        predictions = self.classes_[proba.argmax(axis=1)]
+
+        # Rows where the target class won the vote but didn't clear the
+        # threshold fall back to whichever OTHER class was next-highest.
+        below_threshold = (predictions == self.target_class) & (
+            proba[:, target_index] < self.threshold
+        )
+        if below_threshold.any():
+            fallback_proba = proba.copy()
+            fallback_proba[:, target_index] = -1  # exclude target_class from the fallback vote
+            fallback_predictions = self.classes_[fallback_proba.argmax(axis=1)]
+            predictions = np.where(below_threshold, fallback_predictions, predictions)
+
+        return predictions
 
 
 def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, model_name: str) -> float:
@@ -339,11 +418,102 @@ def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, model_name: s
     return weighted_f1
 
 
-if __name__ == "__main__":
+def load_trained_models() -> dict:
+    """Load the three already-trained ensemble members from models/."""
+    return {
+        "rf": joblib.load(RF_MODEL_PATH),
+        "xgb": joblib.load(XGB_MODEL_PATH),
+        "lgbm": joblib.load(LGBM_MODEL_PATH),
+    }
+
+
+def reconstruct_val_test_splits() -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+    """Reconstruct X_val/y_val/X_test/y_test exactly as main() produced
+    them, without retraining anything - split_train_val_test() is
+    deterministic given the same input and RANDOM_STATE, and the saved
+    scaler/selected-features are loaded rather than re-fit.
+    """
     X, y = load_features_and_target(CICIDS_PATH)
-    X_train, X_test, y_train, y_test = split_train_test(X, y)
+    _, X_val, X_test, _, y_val, y_test = split_train_val_test(X, y)
+
+    with open(SELECTED_FEATURES_PATH) as f:
+        selected_features = json.load(f)
+    X_val = X_val[selected_features]
+    X_test = X_test[selected_features]
+
+    scaler = joblib.load(SCALER_PATH)
+    X_val = pd.DataFrame(scaler.transform(X_val), columns=X_val.columns, index=X_val.index)
+    X_test = pd.DataFrame(scaler.transform(X_test), columns=X_test.columns, index=X_test.index)
+
+    return X_val, y_val, X_test, y_test
+
+
+def sweep_u2r_threshold(
+    ensemble: SoftVotingEnsemble, X_val: pd.DataFrame, y_val: pd.Series, thresholds: list[float]
+) -> None:
+    """Print U2R precision/recall/f1 and overall macro/weighted F1 across a
+    range of confidence thresholds - validation set only, never test.
+    """
+    header = f"{'threshold':>10}  {'U2R prec':>9}  {'U2R rec':>8}  {'U2R f1':>7}  {'macro f1':>9}  {'weighted f1':>11}"
+    print(header)
+    for threshold in thresholds:
+        thresholded = ThresholdedEnsemble(ensemble, target_class="U2R", threshold=threshold)
+        y_pred = thresholded.predict(X_val)
+        report = classification_report(y_val, y_pred, output_dict=True)
+        u2r = report["U2R"]
+        print(
+            f"{threshold:>10.2f}  {u2r['precision']:>9.4f}  {u2r['recall']:>8.4f}  "
+            f"{u2r['f1-score']:>7.4f}  {report['macro avg']['f1-score']:>9.4f}  "
+            f"{report['weighted avg']['f1-score']:>11.4f}"
+        )
+
+
+def sweep_ensemble_weights(
+    models: list, X_val: pd.DataFrame, y_val: pd.Series, weight_options: list[list[float]]
+) -> None:
+    """Print U2R and R2L metrics plus overall macro/weighted F1 across a few
+    candidate [rf, xgb, lgbm] weight combinations - validation set only.
+
+    R2L is tracked explicitly alongside U2R: up-weighting LightGBM to help
+    U2R implicitly down-weights Random Forest, which is currently the
+    strongest model on R2L - this is the number that would reveal that
+    trade-off actually biting, not just an assumption that it might.
+    """
+    header = (
+        f"{'weights':>15}  {'U2R prec':>9}  {'U2R rec':>8}  {'U2R f1':>7}  "
+        f"{'R2L f1':>7}  {'macro f1':>9}  {'weighted f1':>11}"
+    )
+    print(header)
+    for weights in weight_options:
+        ensemble = build_soft_voting_ensemble(models, weights)
+        y_pred = ensemble.predict(X_val)
+        report = classification_report(y_val, y_pred, output_dict=True)
+        u2r = report["U2R"]
+        r2l = report["R2L"]
+        print(
+            f"{str(weights):>15}  {u2r['precision']:>9.4f}  {u2r['recall']:>8.4f}  "
+            f"{u2r['f1-score']:>7.4f}  {r2l['f1-score']:>7.4f}  "
+            f"{report['macro avg']['f1-score']:>9.4f}  {report['weighted avg']['f1-score']:>11.4f}"
+        )
+
+
+def main() -> None:
+    """Run the full training pipeline: split, select features, scale,
+    SMOTE, train all three models, build and evaluate the ensemble.
+
+    Must be reached via `import` (see run_training.py), never by executing
+    this file directly. train_model.py defines custom classes
+    (LabelDecodingClassifier, SoftVotingEnsemble, ThresholdedEnsemble) that
+    get saved via joblib - running this file as a script would define
+    those classes under the module name "__main__", which only unpickles
+    correctly from another direct run of this exact file, not from a
+    normal import elsewhere (notebooks, detector.py, diagnostic scripts).
+    """
+    X, y = load_features_and_target(CICIDS_PATH)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(X, y)
 
     print(f"X_train: {X_train.shape}")
+    print(f"X_val:   {X_val.shape}")
     print(f"X_test:  {X_test.shape}")
 
     print("\nTrain class distribution:")
@@ -357,10 +527,13 @@ if __name__ == "__main__":
         print(f"  {feature}")
 
     X_train = X_train[top_features]
+    X_val = X_val[top_features]
     X_test = X_test[top_features]
 
     print("\nScaling features...")
     X_train, X_test = scale_features(X_train, X_test, SCALER_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    X_val = pd.DataFrame(scaler.transform(X_val), columns=X_val.columns, index=X_val.index)
     print(f"Scaler saved to {SCALER_PATH}")
 
     print("\nApplying SMOTE to training set...")
@@ -396,3 +569,24 @@ if __name__ == "__main__":
     print("\nBuilding soft-voting ensemble...")
     ensemble = build_soft_voting_ensemble([rf_model, xgb_model, lgbm_model])
     evaluate_model(ensemble, X_test, y_test, "Soft-Voting Ensemble")
+
+    # U2R_DECISION_THRESHOLD was chosen on the validation set (see
+    # sweep_u2r_threshold() and PROGRESS.md) and is confirmed here, once,
+    # on test - this is the actual final model, kept alongside the plain
+    # ensemble above rather than replacing it, so the improvement this
+    # threshold makes stays visible and documented rather than silently
+    # overwriting the earlier baseline comparison.
+    print(f"\nApplying U2R decision threshold ({U2R_DECISION_THRESHOLD})...")
+    final_model = ThresholdedEnsemble(ensemble, target_class="U2R", threshold=U2R_DECISION_THRESHOLD)
+    evaluate_model(final_model, X_test, y_test, f"Final: Thresholded Ensemble (U2R >= {U2R_DECISION_THRESHOLD})")
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        "Run this via 'python src/run_training.py', not directly.\n"
+        "train_model.py defines custom classes that get saved with joblib - "
+        "executing this file as a script (rather than importing it) tags "
+        "those classes under the module name '__main__', which breaks "
+        "loading them anywhere else. See run_training.py and main()'s "
+        "docstring for the full explanation."
+    )

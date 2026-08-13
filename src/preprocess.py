@@ -52,6 +52,10 @@ CHUNK_SIZE = 100_000
 # results are reproducible across runs.
 RANDOM_STATE = 42
 
+# Added to denominators in derived-feature ratios to avoid a divide-by-zero
+# producing inf (e.g. a flow with 0 backward packets).
+EPSILON = 1e-9
+
 # --------------------------------------------------------------------------
 # Label mappings: raw dataset labels -> 5 unified attack classes
 # --------------------------------------------------------------------------
@@ -123,6 +127,60 @@ def normalize_web_attack_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
+# Feature engineering (CICIDS2017 only - column names are CICFlowMeter-
+# specific and don't map onto UNSW-NB15's schema)
+# --------------------------------------------------------------------------
+def drop_negative_duration_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows with a negative "Flow Duration".
+
+    A small, known defect in the original CICIDS2017 capture tool corrupts
+    the timestamp on a handful of flows, producing a negative duration.
+    That makes any duration-derived feature (the native "Flow Bytes/s", or
+    our own bytes_per_sec below) meaningless for those rows, so they're
+    dropped rather than fed to a ratio.
+    """
+    return df[df["Flow Duration"] >= 0]
+
+
+def engineer_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add three derived features to CICIDS2017 flow records.
+
+    bytes_per_sec: overall byte rate for the flow. CICIDS2017 already ships
+    a native "Flow Bytes/s" column, so this is a near-duplicate on purpose -
+    Phase 3's feature-importance step will decide whether it earns its keep
+    alongside the original.
+
+    fwd_bwd_ratio: how one-directional a flow is. Flood-style DoS traffic
+    tends to be almost entirely one-way (attacker -> victim), unlike normal
+    two-way conversations. Uses "+1" (Laplace/additive smoothing) rather
+    than "+EPSILON" in the denominator: ~16% of flows have 0 backward
+    packets, which is real signal, not bad data - but dividing by a tiny
+    epsilon sends the ratio into the hundreds of billions for those rows,
+    which would make MinMaxScaler squash every other row's value down to
+    ~0. Dividing by "count + 1" instead keeps the ratio bounded to
+    something proportional to the actual packet counts involved.
+
+    flag_anomaly: rate of "closing" TCP flags (FIN, RST) relative to
+    "opening" flags (SYN). Unusual ratios can indicate scans or malformed
+    handshakes rather than normal connection setup/teardown. Also uses "+1"
+    smoothing for the same reason - 95% of flows have 0 SYN flags (many are
+    UDP, which has no SYN flag at all), so an epsilon here blows up almost
+    the entire column.
+    """
+    total_bytes = df["Total Length of Fwd Packets"] + df["Total Length of Bwd Packets"]
+    flow_duration_sec = df["Flow Duration"] / 1_000_000  # CICFlowMeter reports microseconds
+    df["bytes_per_sec"] = total_bytes / (flow_duration_sec + EPSILON)
+
+    df["fwd_bwd_ratio"] = df["Total Fwd Packets"] / (df["Total Backward Packets"] + 1)
+
+    df["flag_anomaly"] = (df["FIN Flag Count"] + df["RST Flag Count"]) / (
+        df["SYN Flag Count"] + 1
+    )
+
+    return df
+
+
+# --------------------------------------------------------------------------
 # Dataset loaders
 # --------------------------------------------------------------------------
 def load_cicids2017() -> pd.DataFrame:
@@ -131,7 +189,9 @@ def load_cicids2017() -> pd.DataFrame:
     Each of the 8 daily CSVs is read in CHUNK_SIZE-row chunks (see
     CLAUDE.md data rules). For every chunk: column names are stripped, the
     "Web Attack" label variants are normalised, and Label is mapped to one
-    of the 5 unified classes (Normal, DoS, Probe, R2L, U2R).
+    of the 5 unified classes (Normal, DoS, Probe, R2L, U2R). Once every
+    chunk has been loaded, concatenated, and had its constant columns
+    dropped, the three derived features are added.
     """
     csv_files = sorted(CICIDS_DIR.glob("*.csv"))
     cleaned_chunks = []
@@ -142,10 +202,12 @@ def load_cicids2017() -> pd.DataFrame:
             chunk = normalize_web_attack_labels(chunk)
             chunk["Label"] = chunk["Label"].map(CICIDS_LABEL_MAP)
             chunk = handle_inf_and_nan(chunk)
+            chunk = drop_negative_duration_rows(chunk)
             cleaned_chunks.append(chunk)
 
     df = pd.concat(cleaned_chunks, ignore_index=True)
     df = drop_constant_columns(df)
+    df = engineer_derived_features(df)
     return df
 
 

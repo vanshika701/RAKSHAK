@@ -207,7 +207,14 @@ def load_cicids2017() -> pd.DataFrame:
 
     df = pd.concat(cleaned_chunks, ignore_index=True)
     df = drop_constant_columns(df)
+    # Derived features reference specific raw column names (e.g. "SYN Flag
+    # Count") that must still exist under those names at this point - some
+    # get removed as duplicates below (e.g. "SYN Flag Count" is an exact
+    # duplicate of "Fwd PSH Flags" across the full dataset), so dedup must
+    # run after, not before.
     df = engineer_derived_features(df)
+    df = drop_duplicate_columns(df)
+    df = drop_known_redundant_columns(df)
     return df
 
 
@@ -240,6 +247,48 @@ def drop_constant_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     constant_cols = [col for col in df.columns if df[col].nunique() == 1]
     return df.drop(columns=constant_cols)
+
+
+def drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop columns that are exact, bit-for-bit duplicates of an earlier column.
+
+    CICIDS2017's raw CSVs genuinely repeat "Fwd Header Length" as a column
+    header; pandas silently renames the second occurrence to
+    "Fwd Header Length.1" instead of erroring, so an exact duplicate
+    otherwise survives into the cleaned data. Columns are grouped by a hash
+    of their values first, so only genuine hash collisions need a full
+    equality check, rather than comparing every column against every other
+    column (which would be O(n^2) over 2.8M rows).
+    """
+    seen_hashes: dict[int, str] = {}
+    duplicate_cols = []
+    for column in df.columns:
+        column_hash = pd.util.hash_pandas_object(df[column], index=False).sum()
+        if column_hash in seen_hashes and df[column].equals(df[seen_hashes[column_hash]]):
+            duplicate_cols.append(column)
+        else:
+            seen_hashes[column_hash] = column
+    return df.drop(columns=duplicate_cols)
+
+
+def drop_known_redundant_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop CICIDS2017 columns confirmed to duplicate another column's
+    calculation, up to floating-point noise.
+
+    "Avg Bwd/Fwd Segment Size" and "Bwd/Fwd Packet Length Mean" are
+    documented CICFlowMeter quirks - two different names for the same
+    underlying computation (correlation 1.000000, max absolute difference
+    ~1e-6 and ~1e-10 respectively - see notebooks/01_eda.ipynb Section 3).
+
+    Unlike drop_duplicate_columns(), this pair can't be detected
+    generically without risking false positives: some CICIDS2017 column
+    pairs are highly correlated but genuinely different (e.g. "Subflow Fwd
+    Bytes" vs "Total Length of Fwd Packets", correlation 0.999999 but a
+    real difference of up to ~30,000 on some rows), so this list is
+    hardcoded from a specific, verified finding rather than inferred.
+    """
+    columns_to_drop = ["Avg Bwd Segment Size", "Avg Fwd Segment Size"]
+    return df.drop(columns=[c for c in columns_to_drop if c in df.columns])
 
 
 def encode_categorical_columns(

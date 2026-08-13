@@ -22,10 +22,11 @@ from pathlib import Path
 import joblib
 import pandas as pd
 from imblearn.over_sampling import SMOTE
+from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from xgboost import XGBClassifier
 
 # --------------------------------------------------------------------------
@@ -40,6 +41,7 @@ SELECTED_FEATURES_PATH = MODELS_DIR / "selected_features.json"
 SCALER_PATH = MODELS_DIR / "scaler.joblib"
 RF_MODEL_PATH = MODELS_DIR / "rf_model.joblib"
 XGB_MODEL_PATH = MODELS_DIR / "xgb_model.joblib"
+LGBM_MODEL_PATH = MODELS_DIR / "lgbm_model.joblib"
 
 # --------------------------------------------------------------------------
 # Constants
@@ -57,6 +59,10 @@ RF_N_ESTIMATORS = 200
 XGB_N_ESTIMATORS = 300
 XGB_MAX_DEPTH = 6
 XGB_LEARNING_RATE = 0.1
+
+LGBM_N_ESTIMATORS = 300
+LGBM_MAX_DEPTH = 6
+LGBM_LEARNING_RATE = 0.1
 
 # What fraction of X_train to use when fitting the quick Random Forest for
 # feature importances - a speed optimization, not a modeling choice.
@@ -202,7 +208,33 @@ def train_random_forest(X_train: pd.DataFrame, y_train: pd.Series) -> RandomFore
     return rf
 
 
-def train_xgboost(X_train: pd.DataFrame, y_train: pd.Series) -> XGBClassifier:
+class LabelDecodingClassifier:
+    """Wraps a classifier that requires integer-encoded labels so its
+    predict()/predict_proba() interface matches every other model's -
+    working with the original string class names (Normal, DoS, ...).
+
+    XGBoost's sklearn wrapper requires y to already be integers 0..n-1 for
+    fit(), unlike RandomForestClassifier or LightGBM, which accept the
+    string labels directly. Defined as a real class (not a closure or a
+    monkey-patched instance method) so it survives joblib.dump()/load()
+    correctly - a lambda-based patch would not.
+    """
+
+    def __init__(self, model, label_encoder: LabelEncoder):
+        self.model = model
+        self.label_encoder = label_encoder
+        self.classes_ = label_encoder.classes_
+
+    def predict(self, X):
+        return self.label_encoder.inverse_transform(self.model.predict(X))
+
+    def predict_proba(self, X):
+        # Columns already come out in label_encoder's class order, which
+        # matches self.classes_ - needed later for the soft-voting ensemble.
+        return self.model.predict_proba(X)
+
+
+def train_xgboost(X_train: pd.DataFrame, y_train: pd.Series) -> LabelDecodingClassifier:
     """Train the XGBoost ensemble member on the scaled, SMOTE'd training set.
 
     tree_method="hist" is the fast, histogram-based split-finding
@@ -211,6 +243,9 @@ def train_xgboost(X_train: pd.DataFrame, y_train: pd.Series) -> XGBClassifier:
     models' results are directly comparable, in particular on U2R, where
     the Random Forest baseline is currently weak (0.22 precision).
     """
+    label_encoder = LabelEncoder()
+    y_train_encoded = label_encoder.fit_transform(y_train)
+
     xgb = XGBClassifier(
         n_estimators=XGB_N_ESTIMATORS,
         max_depth=XGB_MAX_DEPTH,
@@ -219,8 +254,29 @@ def train_xgboost(X_train: pd.DataFrame, y_train: pd.Series) -> XGBClassifier:
         n_jobs=-1,
         random_state=RANDOM_STATE,
     )
-    xgb.fit(X_train, y_train)
-    return xgb
+    xgb.fit(X_train, y_train_encoded)
+    return LabelDecodingClassifier(xgb, label_encoder)
+
+
+def train_lightgbm(X_train: pd.DataFrame, y_train: pd.Series) -> LGBMClassifier:
+    """Train the LightGBM ensemble member on the scaled, SMOTE'd training set.
+
+    Unlike XGBoost, LightGBM's sklearn wrapper accepts the original string
+    labels directly for fit() - it handles the integer encoding internally,
+    the same as RandomForestClassifier - so no LabelDecodingClassifier
+    wrapper is needed here. verbose=-1 silences LightGBM's per-iteration
+    training log, which is otherwise very noisy at this row count.
+    """
+    lgbm = LGBMClassifier(
+        n_estimators=LGBM_N_ESTIMATORS,
+        max_depth=LGBM_MAX_DEPTH,
+        learning_rate=LGBM_LEARNING_RATE,
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        verbose=-1,
+    )
+    lgbm.fit(X_train, y_train)
+    return lgbm
 
 
 def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, model_name: str) -> float:
@@ -282,3 +338,17 @@ if __name__ == "__main__":
     print(f"Model saved to {RF_MODEL_PATH}")
 
     evaluate_model(rf_model, X_test, y_test, "Random Forest")
+
+    print("\nTraining XGBoost...")
+    xgb_model = train_xgboost(X_train, y_train)
+    joblib.dump(xgb_model, XGB_MODEL_PATH)
+    print(f"Model saved to {XGB_MODEL_PATH}")
+
+    evaluate_model(xgb_model, X_test, y_test, "XGBoost")
+
+    print("\nTraining LightGBM...")
+    lgbm_model = train_lightgbm(X_train, y_train)
+    joblib.dump(lgbm_model, LGBM_MODEL_PATH)
+    print(f"Model saved to {LGBM_MODEL_PATH}")
+
+    evaluate_model(lgbm_model, X_test, y_test, "LightGBM")

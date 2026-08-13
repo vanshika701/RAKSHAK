@@ -16,8 +16,10 @@ Pipeline (see instructions.md Step 3 for the full spec):
 
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import LabelEncoder
 
 # --------------------------------------------------------------------------
 # Paths
@@ -28,12 +30,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DATA_RAW_DIR = PROJECT_ROOT / "data" / "raw"
 DATA_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+MODELS_DIR = PROJECT_ROOT / "models"
 
 CICIDS_DIR = DATA_RAW_DIR / "cicids2017"
 UNSW_DIR = DATA_RAW_DIR / "unsw_nb15"
 
 CICIDS_OUTPUT_PATH = DATA_PROCESSED_DIR / "cicids_clean.parquet"
 UNSW_OUTPUT_PATH = DATA_PROCESSED_DIR / "unsw_clean.parquet"
+
+# Fitted LabelEncoders for UNSW-NB15's text columns, saved here so the exact
+# same string -> int mapping can be reapplied to live traffic in detector.py.
+UNSW_ENCODERS_PATH = MODELS_DIR / "unsw_label_encoders.joblib"
 
 # --------------------------------------------------------------------------
 # Pipeline constants
@@ -80,6 +87,10 @@ UNSW_LABEL_MAP = {
     "Shellcode": "U2R",
     "Worms": "U2R",
 }
+
+# UNSW-NB15's text (non-numeric) feature columns. CICIDS2017 has no
+# equivalent — all of its features are already numeric flow statistics.
+UNSW_CATEGORICAL_COLUMNS = ["proto", "service", "state"]
 
 
 # --------------------------------------------------------------------------
@@ -130,9 +141,12 @@ def load_cicids2017() -> pd.DataFrame:
             chunk = clean_column_names(chunk)
             chunk = normalize_web_attack_labels(chunk)
             chunk["Label"] = chunk["Label"].map(CICIDS_LABEL_MAP)
+            chunk = handle_inf_and_nan(chunk)
             cleaned_chunks.append(chunk)
 
-    return pd.concat(cleaned_chunks, ignore_index=True)
+    df = pd.concat(cleaned_chunks, ignore_index=True)
+    df = drop_constant_columns(df)
+    return df
 
 
 # --------------------------------------------------------------------------
@@ -152,14 +166,58 @@ def handle_inf_and_nan(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def drop_constant_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop columns where every row holds the exact same value.
+
+    A constant column gives a model nothing to split on, and would later
+    break MinMaxScaler outright (max - min == 0 means a division by zero).
+    Which columns qualify is computed dynamically per-dataset rather than
+    hardcoded, since it depends on exactly which raw CSVs got loaded.
+    Must run on the fully concatenated DataFrame, not per-chunk — a column
+    could look constant within one chunk but vary across the full dataset.
+    """
+    constant_cols = [col for col in df.columns if df[col].nunique() == 1]
+    return df.drop(columns=constant_cols)
+
+
+def encode_categorical_columns(
+    df: pd.DataFrame, columns: list[str], save_path: Path
+) -> pd.DataFrame:
+    """Label-encode the given text columns in place and persist the encoders.
+
+    XGBoost, LightGBM, and Random Forest all split on thresholds (e.g. "is
+    this feature <= 1.5?") rather than on linear combinations, so the
+    arbitrary numeric order LabelEncoder introduces (tcp=2, udp=1, ...)
+    does not mislead them the way it would a linear model.
+
+    The fitted encoders are saved to `save_path` so detector.py can apply
+    the exact same string -> int mapping to live traffic later. This must
+    run on the full column, not per-chunk — fitting a fresh encoder on
+    each chunk would give the same string a different number depending on
+    which chunk it appeared in.
+    """
+    encoders = {}
+    for column in columns:
+        encoder = LabelEncoder()
+        df[column] = encoder.fit_transform(df[column])
+        encoders[column] = encoder
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(encoders, save_path)
+    return df
+
+
 def load_unsw_nb15() -> pd.DataFrame:
     """Load and clean both UNSW-NB15 CSVs (training + testing) into one DataFrame.
 
     Both files are read in CHUNK_SIZE-row chunks using "utf-8-sig" encoding,
     which strips the BOM character at the start of the "id" column. For
     every chunk: column names are stripped, a unified "Label" column is
-    built from "attack_cat" via UNSW_LABEL_MAP, and the non-feature /
-    leakage columns ("id", "label", "attack_cat") are dropped.
+    built from "attack_cat" via UNSW_LABEL_MAP, the non-feature / leakage
+    columns ("id", "label", "attack_cat") are dropped, and inf/NaN rows are
+    removed. Once every chunk has been loaded and concatenated, the text
+    columns in UNSW_CATEGORICAL_COLUMNS are label-encoded, and any constant
+    columns are dropped.
     """
     csv_files = sorted(UNSW_DIR.glob("*.csv"))
     cleaned_chunks = []
@@ -169,6 +227,41 @@ def load_unsw_nb15() -> pd.DataFrame:
             chunk = clean_column_names(chunk)
             chunk["Label"] = chunk["attack_cat"].map(UNSW_LABEL_MAP)
             chunk = chunk.drop(columns=["id", "label", "attack_cat"])
+            chunk = handle_inf_and_nan(chunk)
             cleaned_chunks.append(chunk)
 
-    return pd.concat(cleaned_chunks, ignore_index=True)
+    df = pd.concat(cleaned_chunks, ignore_index=True)
+    df = encode_categorical_columns(df, UNSW_CATEGORICAL_COLUMNS, UNSW_ENCODERS_PATH)
+    df = drop_constant_columns(df)
+    return df
+
+
+# --------------------------------------------------------------------------
+# Pipeline entry point
+# --------------------------------------------------------------------------
+def main() -> None:
+    """Run the full cleaning pipeline for both datasets and save as parquet.
+
+    The saved files are cleaned but NOT scaled. MinMax scaling is
+    deliberately deferred until after the train/test split (done later, in
+    train_model.py) so the scaler is fit only on training data - fitting it
+    here, on the full dataset, would leak test-set statistics into training
+    and inflate evaluation results.
+    """
+    DATA_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("Loading and cleaning CICIDS2017...")
+    cicids_df = load_cicids2017()
+    print(f"  {cicids_df.shape[0]:,} rows, {cicids_df.shape[1]} columns")
+    cicids_df.to_parquet(CICIDS_OUTPUT_PATH, index=False)
+    print(f"  saved to {CICIDS_OUTPUT_PATH}")
+
+    print("Loading and cleaning UNSW-NB15...")
+    unsw_df = load_unsw_nb15()
+    print(f"  {unsw_df.shape[0]:,} rows, {unsw_df.shape[1]} columns")
+    unsw_df.to_parquet(UNSW_OUTPUT_PATH, index=False)
+    print(f"  saved to {UNSW_OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()

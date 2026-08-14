@@ -255,16 +255,23 @@ class LabelDecodingClassifier:
     """
 
     def __init__(self, model, label_encoder: LabelEncoder):
+        """Store the wrapped model and the encoder that maps its integer
+        predictions back to the original string class names.
+        """
         self.model = model
         self.label_encoder = label_encoder
         self.classes_ = label_encoder.classes_
 
     def predict(self, X):
+        """Predict, then decode back to string labels."""
         return self.label_encoder.inverse_transform(self.model.predict(X))
 
     def predict_proba(self, X):
-        # Columns already come out in label_encoder's class order, which
-        # matches self.classes_ - needed later for the soft-voting ensemble.
+        """Predict class probabilities.
+
+        Columns already come out in label_encoder's class order, which
+        matches self.classes_ - needed later for the soft-voting ensemble.
+        """
         return self.model.predict_proba(X)
 
 
@@ -328,17 +335,20 @@ class SoftVotingEnsemble:
     def __init__(
         self, models: list, class_labels: np.ndarray, weights: list[float] | None = None
     ):
+        """Store the already-fitted member models and their shared class order."""
         self.models = models
         self.classes_ = class_labels
         self.weights = weights if weights is not None else [1.0] * len(models)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """Average each model's class probabilities, weighted."""
         weighted_probas = [
             weight * model.predict_proba(X) for model, weight in zip(self.models, self.weights)
         ]
         return sum(weighted_probas) / sum(self.weights)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict the class with the highest averaged probability."""
         predicted_indices = self.predict_proba(X).argmax(axis=1)
         return self.classes_[predicted_indices]
 
@@ -371,15 +381,22 @@ class ThresholdedEnsemble:
     """
 
     def __init__(self, ensemble: SoftVotingEnsemble, target_class: str, threshold: float):
+        """Store the wrapped ensemble and the confidence bar `target_class`
+        must clear to actually be predicted.
+        """
         self.ensemble = ensemble
         self.target_class = target_class
         self.threshold = threshold
         self.classes_ = ensemble.classes_
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """Pass through the wrapped ensemble's class probabilities unchanged."""
         return self.ensemble.predict_proba(X)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict normally, then re-route any low-confidence target_class
+        prediction to the next-highest class instead.
+        """
         proba = self.predict_proba(X)
         target_index = list(self.classes_).index(self.target_class)
         predictions = self.classes_[proba.argmax(axis=1)]
@@ -411,7 +428,8 @@ def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series, model_name: s
     print(classification_report(y_test, y_pred, digits=4))
     print("Confusion matrix (rows=actual, cols=predicted):")
     labels = sorted(y_test.unique())
-    print(pd.DataFrame(confusion_matrix(y_test, y_pred, labels=labels), index=labels, columns=labels))
+    cm = confusion_matrix(y_test, y_pred, labels=labels)
+    print(pd.DataFrame(cm, index=labels, columns=labels))
 
     weighted_f1 = f1_score(y_test, y_pred, average="weighted")
     print(f"\nWeighted F1: {weighted_f1:.4f}")
@@ -454,7 +472,10 @@ def sweep_u2r_threshold(
     """Print U2R precision/recall/f1 and overall macro/weighted F1 across a
     range of confidence thresholds - validation set only, never test.
     """
-    header = f"{'threshold':>10}  {'U2R prec':>9}  {'U2R rec':>8}  {'U2R f1':>7}  {'macro f1':>9}  {'weighted f1':>11}"
+    header = (
+        f"{'threshold':>10}  {'U2R prec':>9}  {'U2R rec':>8}  {'U2R f1':>7}  "
+        f"{'macro f1':>9}  {'weighted f1':>11}"
+    )
     print(header)
     for threshold in thresholds:
         thresholded = ThresholdedEnsemble(ensemble, target_class="U2R", threshold=threshold)
@@ -577,8 +598,11 @@ def main() -> None:
     # threshold makes stays visible and documented rather than silently
     # overwriting the earlier baseline comparison.
     print(f"\nApplying U2R decision threshold ({U2R_DECISION_THRESHOLD})...")
-    final_model = ThresholdedEnsemble(ensemble, target_class="U2R", threshold=U2R_DECISION_THRESHOLD)
-    evaluate_model(final_model, X_test, y_test, f"Final: Thresholded Ensemble (U2R >= {U2R_DECISION_THRESHOLD})")
+    final_model = ThresholdedEnsemble(
+        ensemble, target_class="U2R", threshold=U2R_DECISION_THRESHOLD
+    )
+    final_model_name = f"Final: Thresholded Ensemble (U2R >= {U2R_DECISION_THRESHOLD})"
+    evaluate_model(final_model, X_test, y_test, final_model_name)
 
 
 if __name__ == "__main__":

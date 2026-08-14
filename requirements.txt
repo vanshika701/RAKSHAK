@@ -1,0 +1,11 @@
+# pip-installed packages only - see README.md's Setup section for why.
+# numpy/pandas/scikit-learn/matplotlib/seaborn/jupyter are NOT listed here:
+# on Apple Silicon they must be installed via `conda install -c conda-forge`
+# instead of pip, to keep Apple's Accelerate-optimized BLAS backend rather
+# than pip's generic (slower) build.
+xgboost
+lightgbm
+imbalanced-learn
+shap
+flask
+scapy

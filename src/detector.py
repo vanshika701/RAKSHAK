@@ -144,6 +144,9 @@ def main() -> None:
     manager = FlowManager()
 
     def handle_packet(packet) -> None:
+        """Scapy's per-packet callback: bucket the packet into its flow,
+        then classify and log any flow that just finished.
+        """
         manager.process_packet(packet)
         for flow in manager.pop_expired_flows():
             label, confidence = classify_flow(flow, model, scaler, selected_features)
@@ -155,7 +158,9 @@ def main() -> None:
                 else (flow.forward_ip, flow.forward_port)
             )
 
-            log_detection(conn, fwd_ip, fwd_port, bwd_ip, bwd_port, flow.protocol, label, confidence)
+            log_detection(
+                conn, fwd_ip, fwd_port, bwd_ip, bwd_port, flow.protocol, label, confidence
+            )
 
             if label != "Normal":
                 print(

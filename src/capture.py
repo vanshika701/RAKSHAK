@@ -86,10 +86,12 @@ class Flow:
     packets: list[Packet] = field(default_factory=list)
 
     def add_packet(self, packet: Packet) -> None:
+        """Append a packet to this flow and refresh its last-seen time."""
         self.packets.append(packet)
         self.last_seen = packet.timestamp
 
     def is_expired(self, now: float) -> bool:
+        """True once this flow has been idle past FLOW_TIMEOUT_SECONDS."""
         return (now - self.last_seen) > FLOW_TIMEOUT_SECONDS
 
 
@@ -100,6 +102,7 @@ class FlowManager:
     """
 
     def __init__(self):
+        """Start with no active flows."""
         self.flows: dict[tuple, Flow] = {}
 
     def _flow_key(
@@ -306,6 +309,9 @@ def main() -> None:
     manager = FlowManager()
 
     def handle_packet(packet) -> None:
+        """Scapy's per-packet callback: bucket the packet into its flow,
+        then extract and print features for any flow that just finished.
+        """
         manager.process_packet(packet)
         for flow in manager.pop_expired_flows():
             features = extract_features(flow)

@@ -41,7 +41,8 @@ def main() -> None:
     evaluate_model(ensemble, X_val, y_val, "Rebuilt Soft-Voting Ensemble (validation)")
 
     print("\n--- U2R threshold sweep, validation set ---")
-    sweep_u2r_threshold(ensemble, X_val, y_val, thresholds=[0.50, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95])
+    thresholds = [0.50, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+    sweep_u2r_threshold(ensemble, X_val, y_val, thresholds=thresholds)
 
 
 if __name__ == "__main__":

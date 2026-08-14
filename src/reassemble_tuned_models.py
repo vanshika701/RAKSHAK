@@ -41,8 +41,8 @@ def main() -> None:
     joblib.dump(lgbm_tuned, MODELS_DIR / "lgbm_model.joblib")
     print(f"Tuned LightGBM saved to {MODELS_DIR / 'lgbm_model.joblib'}")
 
-    print("\nDone. models/xgb_model.joblib and models/lgbm_model.joblib now hold the tuned versions.")
-    print("models/rf_model.joblib is untouched (still the untuned baseline).")
+    print("\nDone. models/xgb_model.joblib and models/lgbm_model.joblib now hold the tuned")
+    print("versions. models/rf_model.joblib is untouched (still the untuned baseline).")
 
 
 if __name__ == "__main__":

@@ -28,3 +28,7 @@ models/tuned_from_colab/
 
 # ===== Secrets / local config =====
 .env
+
+# ===== Personal =====
+# Interview prep notes - personal study material, not project documentation.
+PREPARATION.md

@@ -100,11 +100,21 @@ stratified split, the row-duplication leak fix).
       tunable parameter with documented trade-offs rather than an unambiguous improvement.
       Merged into `main()` as an additional final evaluation step, kept alongside the plain
       ensemble rather than replacing it so the improvement stays visible.
-- [ ] Train/evaluate a model on the common 6-feature schema for genuine cross-dataset
-      validation — infrastructure already built and verified (`cicids_common.parquet` /
-      `unsw_common.parquet`), just needs a model trained on it
-- [ ] Document the generalization gap in a notebook (expected to be real and worth reporting,
-      not a bug to hide)
+- [x] Train/evaluate a model on the common 6-feature schema for genuine cross-dataset
+      validation, and document the generalization gap (`notebooks/05_cross_dataset_validation.ipynb`).
+      Single Random Forest (`class_weight="balanced"`, no SMOTE - deliberately simpler than the
+      main pipeline), trained once on CICIDS2017's common-schema split, evaluated twice without
+      retraining: in-distribution on CICIDS2017's own test split (weighted F1 0.9770, macro F1
+      0.6922) vs. zero-shot on the entirety of UNSW-NB15 (weighted F1 **0.3988**, macro F1
+      **0.1431** - the model predicts "Normal" for essentially every row). Traced the collapse to
+      a real, measurable cause rather than leaving it unexplained: UNSW-NB15's flows are
+      systematically larger across every shared feature (median duration ~7.6x longer, forward
+      bytes ~15x more, throughput ~6.6x higher) - likely differing CICFlowMeter vs. Argus
+      capture/aggregation conventions - so Random Forest's hard numeric thresholds, learned from
+      CICIDS2017's value ranges, collapse almost all UNSW-NB15 rows into the same leaf. Legitimate,
+      citable finding for the report: a shared feature name/definition doesn't guarantee a shared
+      feature distribution - genuine transfer would need per-dataset normalization or a
+      domain-adaptation approach, not just matching column names.
 - [x] Target metric (weighted F1 > 95%) — cleared by every individual model AND the ensemble
 - [ ] (Optional, flagged but not investigated) Check whether any duplicate-feature rows in
       CICIDS2017 carry conflicting labels — a data-quality note worth a line in the report

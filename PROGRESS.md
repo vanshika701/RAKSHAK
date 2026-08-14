@@ -30,7 +30,14 @@ ends, already in flight) → Phase 6 → Phase 7 → Phase 8 → circle back to 
       else in this phase is done and verified)
 
 ## Phase 2 — Data Pipeline
-- [ ] Write UNSW-NB15's own EDA notebook — only CICIDS2017's (`01_eda.ipynb`) exists so far
+- [x] Write UNSW-NB15's own EDA notebook (`notebooks/04_unsw_eda.ipynb`) — mirrors `01_eda.ipynb`'s
+      structure. Key finding: UNSW-NB15's class balance is very different from CICIDS2017's -
+      Normal is only 55.7% here (vs. 80.3%), U2R is proportionally ~15x more common (1.05% vs
+      0.07%), and R2L isn't a minority class at all (17.1% vs 0.57%). Also confirmed UNSW-NB15's
+      top correlated features (`dttl`, `ct_*` rolling-connection-counts) are a completely
+      different family than CICIDS2017's packet-size/timing stats - expected, given the two
+      datasets use different capture tools (Argus vs CICFlowMeter). Both points matter directly
+      for Phase 5's cross-dataset validation - a real evaluation, not an apples-to-apples one.
 
 ## Phase 3 — Feature Engineering
 Nothing left — fully complete and verified (derived features, top-25 selection, SMOTE,

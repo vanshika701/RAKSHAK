@@ -98,7 +98,7 @@ ids_project/
 - [x] Phase 4 — Model training
 - [x] Phase 5 — Ensemble + cross-dataset validation
 - [x] Phase 6 — Live capture engine
-- [ ] Phase 7 — Flask dashboard (code written, end-to-end browser test not yet confirmed)
+- [x] Phase 7 — Flask dashboard
 - [ ] Phase 8 — Report + documentation
 
 Update this checklist as phases are completed.

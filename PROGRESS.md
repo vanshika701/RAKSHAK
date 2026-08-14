@@ -30,18 +30,10 @@ left untuned (diminishing-returns call, not revisited).
 - [ ] (Optional) Check whether any duplicate-feature rows in CICIDS2017 carry conflicting labels
       — a data-quality note worth a line in the report either way
 
-## Phase 7 — Dashboard
-- [x] `src/app.py` and `src/templates/dashboard.html` written (Flask routes `/`, `/api/recent`,
-      `/api/alerts`, `/api/stats`; connection table, alerts panel, summary cards, 5s auto-refresh)
-- [ ] Confirm end-to-end in the browser: `detector.py` running + `app.py` running + dashboard
-      actually showing live data - not yet confirmed working (last attempt hit a conda-env issue,
-      since fixed, but success hasn't been confirmed back)
-
 ## Phase 8 — Documentation & Report
 - [ ] `README.md` — setup instructions + architecture diagram
 - [ ] Internship report (problem statement, literature review, dataset description, methodology,
       results, cross-dataset generalization analysis, limitations, future scope, conclusion,
       references)
-- [ ] Presentation slide deck (10-12 slides)
 - [ ] Final code cleanup pass (docstrings, remove debug prints, `flake8 src/`)
 - [ ] Final tidy GitHub push

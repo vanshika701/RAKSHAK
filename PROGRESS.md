@@ -121,11 +121,43 @@ stratified split, the row-duplication leak fix).
       either way
 
 ## Phase 6 — Live Detection Engine
-- [ ] Write `src/capture.py` — Scapy packet capture, flow grouping by (src IP, dst IP, port,
-      protocol), feature extraction matching `selected_features.json`
-- [ ] Write `src/detector.py` — load ensemble + scaler + selected features, inference loop,
-      SQLite logging (timestamp, src IP, label, confidence)
-- [ ] Test against real local network traffic
+- [x] Write `src/capture.py` — Scapy packet capture, flow grouping by a direction-independent
+      5-tuple key, feature extraction matching `selected_features.json`'s 25 columns. Built and
+      tested against real local traffic (DNS, HTTPS, QUIC-over-UDP). Found and fixed two real
+      bugs via live testing: (1) packet length included the Ethernet frame header, inflating
+      every length feature by 14 bytes versus CICFlowMeter's IP-packet-only convention - fixed
+      to use the IP layer's length instead; (2) forward/backward direction was decided eagerly
+      from whichever packet was captured first, which silently reversed `Destination Port` and
+      every Fwd/Bwd feature for any TCP connection that was already open before `capture.py`
+      started sniffing (confirmed live: a `20.207.73.82:443` flow got labeled backwards, with
+      `Destination Port` coming out as the local machine's ephemeral port instead of 443) - fixed
+      by deferring direction to flow-close time and using a bare TCP SYN (flag `S` without `A`)
+      as authoritative proof of who initiated the connection, falling back to first-packet-seen
+      only when no SYN was ever observed (UDP, or a connection that predates the capture start).
+      Two documented approximations, not silently exact: `Subflow Fwd/Bwd Bytes` approximated as
+      total fwd/bwd bytes (real CICFlowMeter sub-flow splitting not replicated); standard
+      deviation uses population (`ddof=0`) not sample (`ddof=1`) formula, since CICFlowMeter's own
+      convention isn't recoverable from the training CSVs and population std gives single-packet
+      flows a well-defined 0.0 instead of NaN.
+- [x] Write `src/detector.py` — loads the ensemble via `train_model.py`'s own saved artifacts
+      (no duplicated logic), reuses `capture.py`'s `FlowManager`/`extract_features()`, logs every
+      classification to SQLite (`detections.db` - timestamp, src/dst IP+port, protocol, label,
+      confidence), prints `[ALERT]` only for non-Normal predictions. Confidence is looked up at
+      the *actually predicted* label's index, not `max(predict_proba())` - those differ once
+      `ThresholdedEnsemble` overrides the winning class, which a naive `.max()` would get wrong.
+      Found and fixed a real, unrelated bug via this testing: `models/xgb_model.joblib` and
+      `models/lgbm_model.joblib` were still the ones from the *first, broken* Colab reassembly
+      (mismatched feature set, from before the sklearn-version feature-selection bug was fixed)
+      - they'd silently drifted out of sync with `rf_model.joblib` and `selected_features.json`
+      and nothing had exercised the full three-model ensemble together since, so it went
+      unnoticed until `detector.py` did. Fixed by rerunning `python src/run_training.py` to
+      regenerate a fully consistent (untuned) baseline set of all three models + scaler +
+      feature list together - confirmed identical to the original baseline numbers (weighted F1
+      0.9985, U2R F1 0.6526 with the threshold applied), so nothing was lost. The eventual
+      Colab-tuned models still need to be swapped in properly once that run completes.
+- [x] Test against real local network traffic - both `capture.py` (feature extraction) and
+      `detector.py` (end-to-end capture -> classify -> log) verified against real DNS/HTTPS/QUIC
+      traffic on the local network, logging correctly to `detections.db`.
 
 ## Phase 7 — Dashboard
 - [ ] Write `src/app.py` — Flask routes (`/`, `/api/recent`, `/api/alerts`, `/api/stats`)

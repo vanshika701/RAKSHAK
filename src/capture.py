@@ -187,7 +187,7 @@ class FlowManager:
         return [self.flows.pop(key) for key in expired_keys]
 
 
-def _true_forward_endpoint(flow: Flow) -> tuple[str, int]:
+def true_forward_endpoint(flow: Flow) -> tuple[str, int]:
     """Decide which of the flow's two endpoints actually initiated it.
 
     A bare TCP SYN (flag "S" without "A") is unambiguous proof of who
@@ -235,7 +235,7 @@ def extract_features(flow: Flow) -> dict:
     the same way scale_features() expects a fixed column order.
     """
     packets = flow.packets
-    true_fwd_endpoint = _true_forward_endpoint(flow)
+    true_fwd_endpoint = true_forward_endpoint(flow)
     true_bwd_endpoint = (
         (flow.backward_ip, flow.backward_port)
         if true_fwd_endpoint == (flow.forward_ip, flow.forward_port)
@@ -309,7 +309,7 @@ def main() -> None:
         manager.process_packet(packet)
         for flow in manager.pop_expired_flows():
             features = extract_features(flow)
-            fwd_ip, fwd_port = _true_forward_endpoint(flow)
+            fwd_ip, fwd_port = true_forward_endpoint(flow)
             bwd_ip, bwd_port = (
                 (flow.backward_ip, flow.backward_port)
                 if (fwd_ip, fwd_port) == (flow.forward_ip, flow.forward_port)
